@@ -44,3 +44,9 @@ add_executable(strata-vision strata_vision.cpp)
 target_link_libraries(strata-vision PRIVATE mtmd llama)
 target_compile_features(strata-vision PRIVATE cxx_std_17)
 set_target_properties(strata-vision PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+if(STRATA_VISION_HIP AND NOT WIN32)
+  # AMD port: ggml-hip is built as a static library here, and its objects are not position-independent, so the
+  # default PIE link (Ubuntu's g++) fails with "relocation R_X86_64_32 ... recompile with -fPIE".  A non-PIE
+  # executable links them as they are (llama.cpp's own ROCm build avoids this by making ggml-hip a shared library).
+  target_link_options(strata-vision PRIVATE -no-pie)
+endif()
