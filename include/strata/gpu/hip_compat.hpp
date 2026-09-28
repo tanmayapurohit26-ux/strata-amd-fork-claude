@@ -171,6 +171,38 @@ static __device__ __forceinline__ void strata_hip_syncwarp() {
 static __device__ __forceinline__ void strata_hip_nanosleep(unsigned) { __builtin_amdgcn_s_sleep(1); }
 #define __nanosleep strata_hip_nanosleep
 
+// ---- round-to-nearest arithmetic that must NOT be fused ------------------------------------------------------
+// On NVIDIA, __fmul_rn / __fadd_rn are never merged into a fused multiply-add: that is exactly why Strata uses them
+// where it copies ggml's rounding bit for bit (Q8_K quantisation, the embedding gather, the native kernels).  HIP
+// defines them as plain `a * b`, and its compiler then fuses them with a following add (checked: `__fmul_rn(a,b) +
+// c` compiled to one v_fmaak_f32 on gfx1100), which skips the rounding of the product and changes results.  These
+// versions switch contraction off inside the function, so the multiply and the add stay separate instructions.
+static __device__ __forceinline__ float strata_hip_fmul_rn(float a, float b) {
+#pragma clang fp contract(off)
+    return a * b;
+}
+static __device__ __forceinline__ float strata_hip_fadd_rn(float a, float b) {
+#pragma clang fp contract(off)
+    return a + b;
+}
+static __device__ __forceinline__ float strata_hip_fsub_rn(float a, float b) {
+#pragma clang fp contract(off)
+    return a - b;
+}
+static __device__ __forceinline__ double strata_hip_dmul_rn(double a, double b) {
+#pragma clang fp contract(off)
+    return a * b;
+}
+static __device__ __forceinline__ double strata_hip_dadd_rn(double a, double b) {
+#pragma clang fp contract(off)
+    return a + b;
+}
+#define __fmul_rn strata_hip_fmul_rn
+#define __fadd_rn strata_hip_fadd_rn
+#define __fsub_rn strata_hip_fsub_rn
+#define __dmul_rn strata_hip_dmul_rn
+#define __dadd_rn strata_hip_dadd_rn
+
 // ---- byte-wise integer helpers -----------------------------------------------------------------------------
 // __dp4a: signed 4 x int8 dot product accumulated into an int.  RDNA3 has it as one instruction (v_dot4_i32_iu8).
 static __device__ __forceinline__ int strata_hip_dp4a(const int a, const int b, const int c) {
