@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Strata one-click setup and start (Windows and Linux, NVIDIA GPUs).
+"""Strata one-click setup and start (Windows and Linux, NVIDIA GPUs; Linux AMD RDNA GPUs with ROCm - the AMD port).
 
     START-HERE.bat  (Windows)   /   ./setup.sh  (Linux)      - they install Python if needed and run this file
 
@@ -95,6 +95,8 @@ ESP_VECTOR = ROOT / "data" / "experimental-speed-projection" / "Qwen3.8-Flash-Ne
 # sizes its expert slots around it and the default reserve (700 MiB) is enough; engines before 0.1.2 need more
 VISION = {"gpu": {"max_tokens": 1024, "reserve_mib": 700},
           "cpu": {"max_tokens": 300, "reserve_mib": 700}}
+# AMD port: ROCm's install folder (the HIP compiler, hipBLAS and the runtime libraries).
+ROCM = Path(os.environ.get("ROCM_PATH", "/opt/rocm"))
 EXE = "strata.exe" if WIN else "strata"
 VEXE = "strata-vision.exe" if WIN else "strata-vision"
 
@@ -234,9 +236,44 @@ def _cpuid_avx512_full() -> bool:
 def gpu_info():
     s = out(["nvidia-smi", "--query-gpu=name,memory.total,compute_cap,driver_version", "--format=csv,noheader,nounits"])
     if not s.strip():
-        return None
+        return amd_gpu_info()
     name, mem, cc, drv = [x.strip() for x in s.strip().splitlines()[0].split(",")]
-    return {"name": name, "vram_gb": float(mem) / 1024.0, "arch": cc.replace(".", ""), "driver": drv}
+    return {"vendor": "nvidia", "name": name, "vram_gb": float(mem) / 1024.0, "arch": cc.replace(".", ""), "driver": drv}
+
+
+def is_amd(gpu) -> bool:
+    return bool(gpu) and gpu.get("vendor") == "amd"
+
+
+def amd_gpu_info():
+    """AMD port (Linux): the AMD card with the most VRAM, from the kernel's amdgpu files; its gfx id from rocminfo."""
+    if WIN:
+        return None
+    cards = []
+    for dev in sorted(Path("/sys/class/drm").glob("card[0-9]*/device")):
+        try:
+            if (dev / "vendor").read_text().strip() != "0x1002":
+                continue
+            cards.append(int((dev / "mem_info_vram_total").read_text().strip()))
+        except (OSError, ValueError):
+            continue
+    if not cards:
+        return None
+    ri = out([str(ROCM / "bin" / "rocminfo")]) or out(["rocminfo"])
+    agents = []                                        # (gfx id, marketing name) of every GPU agent
+    for block in re.split(r"\n\*+\s*\n\s*Agent \d+", ri)[1:]:
+        m = re.search(r"^\s*Name:\s*(gfx[0-9a-f]+)\s*$", block, re.M)
+        if m:
+            mn = re.search(r"^\s*Marketing Name:\s*(.+?)\s*$", block, re.M)
+            agents.append((m.group(1), mn.group(1) if mn else m.group(1)))
+    # prefer a discrete RDNA card (gfx10xx/11xx/12xx; an integrated GPU shows up as gfx1036, gfx1103, ...)
+    agents.sort(key=lambda a: (a[0] in ("gfx1036", "gfx1103", "gfx1150", "gfx1151", "gfx90c"), a[0]))
+    arch, name = agents[0] if agents else ("", "AMD GPU")
+    try:
+        ver = (ROCM / ".info" / "version").read_text().strip()
+    except OSError:
+        ver = "not found"
+    return {"vendor": "amd", "name": name, "vram_gb": max(cards) / 2 ** 30, "arch": arch, "driver": ver}
 
 
 def find_nvcc():
@@ -407,6 +444,8 @@ def driver_major(gpu):
 
 def get_prebuilt(url_base, gpu, vision) -> Path | None:
     """The ready-made engine in engine/ (kept between runs), or None when there is none for this PC."""
+    if is_amd(gpu):
+        return None                                    # AMD port: no ready-made engine, it is compiled on this PC
     eng = ROOT / "engine"
     info = eng / "BUILD.json"
     if info.exists() and (eng / EXE).exists():
@@ -496,7 +535,7 @@ def update_installed_engine(url_base) -> None:
     if local:
         try:                                           # a failed compile must not stop the model from starting
             if gpu is None:
-                raise RuntimeError("no NVIDIA GPU found")
+                raise RuntimeError("no supported GPU found")
             build_engine(gpu, vision, False, get_llama_cpp())
         except (Exception, SystemExit) as e:
             warn(f"could not compile the updated engine{'' if isinstance(e, SystemExit) else f' ({e})'}: starting the installed one")
@@ -515,8 +554,33 @@ def update_installed_engine(url_base) -> None:
     pip_install(CUDA_WHEELS, "NVIDIA CUDA libraries (cuBLAS, CUDA runtime; ~0.4 GB)")
 
 
+def find_rocm_tools():
+    """AMD port: ROCm's clang (the HIP compiler) and hipBLAS, or the list of what is missing."""
+    clang = ROCM / "llvm" / "bin" / "clang++"
+    missing = []
+    if not (ROCM / "bin" / "hipcc").exists() or not clang.exists():
+        missing.append(f"the ROCm HIP compiler ({ROCM}/bin/hipcc, {clang})")
+    if not any((ROCM / d / "cmake" / "hipblas" / "hipblas-config.cmake").exists() for d in ("lib", "lib64")):
+        missing.append("hipBLAS development files (package hipblas-dev)")
+    if not any((ROCM / d / "cmake" / "hip" / "hip-config.cmake").exists() for d in ("lib", "lib64")):
+        missing.append("the HIP CMake files (package hip-dev)")
+    if shutil.which("g++") is None:
+        missing.append("the C++ compiler (build-essential)")
+    return str(clang), missing
+
+
 def install_build_tools(gpu, yes):
     """The compiler and the CUDA toolkit, installed for the user (asks once).  Returns (nvcc, vcvars)."""
+    if is_amd(gpu):
+        # AMD port: ROCm is not installed from here - its version has to match the kernel driver, and it is a
+        # system-wide install the user should choose.  Only check it and say exactly what is missing.
+        clang, missing = find_rocm_tools()
+        if missing:
+            fail("the AMD build needs: " + "; ".join(missing),
+                 f"install ROCm (https://rocm.docs.amd.com - the 'rocm' package includes all of it), or set ROCM_PATH "
+                 f"if it is not in {ROCM}, then run this again")
+        ok(f"build tools present (ROCm {gpu['driver']}, {clang})")
+        return clang, None
     nvcc, cuda_v = find_nvcc()
     need_cuda = (12, 8) if int(gpu["arch"]) >= 120 else (12, 0)
     vcvars = find_vcvars() if WIN else None
@@ -627,20 +691,38 @@ def build_engine(gpu, vision, yes, llama) -> Path:
     if not engine_ok:
         say("  The engine's source changed: compiling it again (only what changed, a few minutes) ..."
             if local and (eng / EXE).exists() else "  Compiling the Strata engine for your GPU (10-20 minutes, once) ...")
-        cmake_build(ROOT, ROOT / "build", "strata",
-                    ["-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_BUILD_TESTS=OFF", f"-DCMAKE_CUDA_ARCHITECTURES={gpu['arch']}",
-                     f"-DCMAKE_CUDA_COMPILER={nvcc}", f"-DSTRATA_GGML_DIR={llama}"], vcvars, "build-strata.bat")
-        shutil.copy2(ROOT / "build" / EXE, eng / EXE)
+        if is_amd(gpu):
+            # AMD port: the same sources compiled with ROCm's HIP (see hip_shim/ and include/strata/gpu/)
+            cmake_build(ROOT, ROOT / "build-hip", "strata",
+                        ["-DSTRATA_ENABLE_HIP=ON", "-DSTRATA_BUILD_TESTS=OFF", f"-DCMAKE_HIP_ARCHITECTURES={gpu['arch']}",
+                         f"-DCMAKE_HIP_COMPILER={nvcc}", f"-DCMAKE_PREFIX_PATH={ROCM}", f"-DSTRATA_GGML_DIR={llama}"],
+                        vcvars, "build-strata.bat")
+            shutil.copy2(ROOT / "build-hip" / EXE, eng / EXE)
+        else:
+            cmake_build(ROOT, ROOT / "build", "strata",
+                        ["-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_BUILD_TESTS=OFF", f"-DCMAKE_CUDA_ARCHITECTURES={gpu['arch']}",
+                         f"-DCMAKE_CUDA_COMPILER={nvcc}", f"-DSTRATA_GGML_DIR={llama}"], vcvars, "build-strata.bat")
+            shutil.copy2(ROOT / "build" / EXE, eng / EXE)
     if not vision_ok:
-        say("  Compiling the image encoder" + (" with CUDA (10-20 minutes, once) ..." if vision == "gpu" else " ..."))
-        defs = [f"-DLLAMA_DIR={llama}", f"-DSTRATA_VISION_CUDA={'ON' if vision == 'gpu' else 'OFF'}"]
-        if vision == "gpu":
-            defs += [f"-DCMAKE_CUDA_ARCHITECTURES={gpu['arch']}", f"-DCMAKE_CUDA_COMPILER={nvcc}"]
+        gpu_api = "ROCm" if is_amd(gpu) else "CUDA"
+        say("  Compiling the image encoder" + (f" with {gpu_api} (10-20 minutes, once) ..." if vision == "gpu" else " ..."))
+        if is_amd(gpu):
+            defs = [f"-DLLAMA_DIR={llama}", f"-DSTRATA_VISION_HIP={'ON' if vision == 'gpu' else 'OFF'}"]
+            if vision == "gpu":
+                defs += [f"-DGPU_TARGETS={gpu['arch']}", f"-DCMAKE_HIP_COMPILER={nvcc}", f"-DCMAKE_PREFIX_PATH={ROCM}"]
+        else:
+            defs = [f"-DLLAMA_DIR={llama}", f"-DSTRATA_VISION_CUDA={'ON' if vision == 'gpu' else 'OFF'}"]
+            if vision == "gpu":
+                defs += [f"-DCMAKE_CUDA_ARCHITECTURES={gpu['arch']}", f"-DCMAKE_CUDA_COMPILER={nvcc}"]
         cmake_build(ROOT / "tools" / "vision", ROOT / "build-vision", "strata-vision", defs, vcvars, "build-vision.bat")
         shutil.copy2(ROOT / "build-vision" / "bin" / VEXE, eng / VEXE)
-    bindir = Path(nvcc).parent                            # the toolkit's own libraries (bin, bin/x64, lib64)
-    dirs = [str(d) for d in (bindir, bindir / "x64", bindir.parent / "lib64") if d.is_dir()]
-    stamp.write_text(json.dumps({"source": "local", "archs": [int(gpu["arch"])], "vision": vision,
+    if is_amd(gpu):
+        dirs = [str(d) for d in (ROCM / "lib", ROCM / "lib64") if d.is_dir()]   # libamdhip64, libhipblas, ...
+    else:
+        bindir = Path(nvcc).parent                        # the toolkit's own libraries (bin, bin/x64, lib64)
+        dirs = [str(d) for d in (bindir, bindir / "x64", bindir.parent / "lib64") if d.is_dir()]
+    stamp.write_text(json.dumps({"source": "local", "vendor": gpu.get("vendor", "nvidia"),
+                                 "archs": [gpu["arch"] if is_amd(gpu) else int(gpu["arch"])], "vision": vision,
                                  "cuda_dirs": dirs, "src": src, "vision_src": vsrc if want_vision else None}, indent=1))
     ok(f"engine compiled: {eng / EXE}")
     return eng
@@ -754,13 +836,22 @@ def main() -> int:
     step(1, "checking your PC")
     gpu = gpu_info()
     if gpu is None:
-        fail("no NVIDIA GPU found (nvidia-smi did not answer)",
+        fail("no NVIDIA GPU found (nvidia-smi did not answer), and no AMD GPU either",
              "install the NVIDIA driver from https://www.nvidia.com/drivers and restart the PC")
-    ok(f"GPU: {gpu['name']}, {gpu['vram_gb']:.1f} GB VRAM, compute capability {gpu['arch'][:-1]}.{gpu['arch'][-1]}, "
-       f"driver {gpu['driver']}")
-    if int(gpu["arch"]) < 80:
+    if is_amd(gpu):
+        ok(f"GPU: {gpu['name']} ({gpu['arch'] or 'gfx id unknown'}), {gpu['vram_gb']:.1f} GB VRAM, ROCm {gpu['driver']}")
+        # the kernels assume 32-lane waves: RDNA 1-4 (gfx10xx, gfx11xx, gfx12xx); GCN/CDNA (gfx9xx) run 64-lane
+        if not re.match(r"gfx1[012]\d\w$", gpu["arch"] or ""):
+            fail(f"the AMD build of Strata needs an RDNA GPU (gfx10xx / gfx11xx / gfx12xx); rocminfo reports "
+                 f"'{gpu['arch'] or 'nothing'}'", f"check that ROCm is installed and `{ROCM}/bin/rocminfo` lists the card")
+        if gpu["arch"] != "gfx1100":
+            warn(f"the AMD port was written for gfx1100 (RX 7900 XT/XTX); {gpu['arch']} should work but is untested")
+    else:
+        ok(f"GPU: {gpu['name']}, {gpu['vram_gb']:.1f} GB VRAM, compute capability {gpu['arch'][:-1]}.{gpu['arch'][-1]}, "
+           f"driver {gpu['driver']}")
+    if not is_amd(gpu) and int(gpu["arch"]) < 80:
         fail("this GPU is older than the RTX 30 series (compute capability 8.0 is required)")
-    if driver_major(gpu) < MIN_DRIVER:
+    if not is_amd(gpu) and driver_major(gpu) < MIN_DRIVER:
         fail(f"the NVIDIA driver is too old ({gpu['driver']}; {MIN_DRIVER} or newer is needed)",
              "update it with the NVIDIA App or from https://www.nvidia.com/drivers, restart, and run this again")
     if gpu["vram_gb"] < 11:
@@ -914,14 +1005,31 @@ def main() -> int:
                 except OSError:
                     pass
             download(fam["hf"].format(q=model) + s.name, s)
+    if a.gguf_dir and family == "qwen" and not shards[1].exists():
+        # AMD port / --gguf-dir: shard 2 (the 28.8 GB word lookup table) is byte-identical for every GSQ-RCO size.
+        # If another size's copy is nearby, link it in under this size's name: no download, no extra disk space.
+        pattern = "Qwen3.8-Flash-Next-GSQ-RCO-*-00002-of-00002.gguf"
+        near = [shards[1].parent, shards[1].parent.parent, Path(a.models_dir)]
+        cands = [p for d in near if d.is_dir() for p in [*d.glob(pattern), *d.glob("*/" + pattern)]
+                 if p.is_file() and p.stat().st_size == 28_800_138_432]
+        if cands:
+            try:
+                os.link(cands[0], shards[1])
+                ok(f"{shards[1].name}: linked to {cands[0]} (identical file, no extra space)")
+            except OSError:
+                shutil.copyfile(cands[0], shards[1])
+                ok(f"{shards[1].name}: copied from {cands[0]} (identical file; a link was not possible)")
     for s in shards:
         if not s.exists():
             fail(f"missing {s}")
     ok("model files present")
     mmproj = Path(a.models_dir) / fam["mmproj"]
     if vision != "none":
-        if not mmproj.exists() and a.gguf_dir and (Path(a.gguf_dir) / fam["mmproj"]).exists():
-            mmproj = Path(a.gguf_dir) / fam["mmproj"]
+        # AMD port: also look one folder up (a download of the whole Hugging Face repo keeps the encoder beside
+        # the IQ3_XXS/, IQ3_S/ ... folders), so an encoder that is already on disk is not downloaded again
+        near = [Path(a.gguf_dir) / fam["mmproj"], Path(a.gguf_dir).parent / fam["mmproj"]] if a.gguf_dir else []
+        if not mmproj.exists() and any(p.exists() for p in near):
+            mmproj = next(p for p in near if p.exists())
         else:
             download(fam["mmproj_hf"] + fam["mmproj"], mmproj, "vision encoder")
         ok(f"vision encoder: {mmproj}")

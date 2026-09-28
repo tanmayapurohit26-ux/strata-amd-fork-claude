@@ -59,7 +59,18 @@ DeviceInfo device_info(int ordinal) {
     // The engine is written against sm_120.  Compiling for it is enforced by CMake; RUNNING on something else
     // is caught here, because a binary can be carried to a machine with an older card and would otherwise
     // silently take whatever path the driver chose.
+#if defined(STRATA_HIP)
+    // AMD port: HIP reports the gfx id as major.minor (gfx1100 -> 11.0).  What the kernels actually depend on is
+    // a 32-lane wave, so that is what is checked.
+    if (p.warpSize != 32) {
+        throw CudaError("device " + d.name + " runs " + std::to_string(p.warpSize) +
+                            "-lane waves; the AMD build of Strata needs an RDNA GPU (32-lane waves)",
+                        -1);
+    }
+    if ((false)) {
+#else
     if (d.cc_major != 12) {
+#endif
         throw CudaError("device " + d.name + " reports compute capability " + std::to_string(d.cc_major) +
                             "." + std::to_string(d.cc_minor) +
                             "; Strata targets sm_120 (RTX 5000 series / Blackwell) only",

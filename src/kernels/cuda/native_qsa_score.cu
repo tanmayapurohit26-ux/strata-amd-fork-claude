@@ -29,6 +29,7 @@ namespace strata::kernels {
 namespace {
 std::atomic<bool> enabled{false};
 constexpr int D=128, HEADS=4, R=4, ROWS=32, WARPS=2, STRIDE=36, COMBINE=68;
+#if !defined(STRATA_HIP)
 struct TileA { uint32_t x[4]; };
 struct TileB { uint32_t x[2]; };
 struct TileC { float x[4]={0.0f,0.0f,0.0f,0.0f}; };
@@ -119,6 +120,59 @@ __global__ __launch_bounds__(64,1) void score_kernel(
         for(int i=row*R;i<n&&i<(row+1)*R;++i)cells[i]=sum;
     }
 }
+#else
+// AMD port: the NVIDIA kernel above feeds raw F32 bits to TF32 tensor-core instructions (ldmatrix + mma.sync
+// m16n8k8.tf32), which RDNA3 does not have.  This version computes the same sums with ordinary F32 fused
+// multiply-adds, keeping the reference's structure: each of the two waves sums its own half of the 128-wide K
+// (columns [w*32, w*32+32) and [w*32+64, w*32+96)), and the halves are combined in the same order.  The only
+// numeric difference is that F32 keeps more mantissa bits than TF32, so scores can differ in the last bits.
+__global__ __launch_bounds__(64) void score_kernel(
+        const float* __restrict__ pooled,const float* __restrict__ query,
+        const float* __restrict__ bias,const int32_t* __restrict__ step,
+        int max_cells,float* __restrict__ cells) {
+    const int n=step[kStepNKv],full=step[kStepNBid];
+    if(n<1||n>max_cells||step[kStepPos]!=n-1||full!=n/R||
+       step[kStepWidth]!=(n<2051?n:2051))return;
+    const int row0=blockIdx.x*ROWS;
+    if(row0>full)return;
+    const int lane=threadIdx.x,warp=threadIdx.y;
+    __shared__ float shared[HEADS*COMBINE];
+    const int row=row0+lane;
+    float acc[HEADS];
+#pragma unroll
+    for(int h=0;h<HEADS;++h)acc[h]=0.0f;
+    if(row<=full){
+        const float* prow=pooled+size_t(row)*D;
+#pragma unroll
+        for(int half=0;half<2;++half){
+            const int base=warp*32+half*64;
+            for(int k=0;k<32;++k){
+                const float x=prow[base+k];
+#pragma unroll
+                for(int h=0;h<HEADS;++h)acc[h]=fmaf(x,query[h*D+base+k],acc[h]);
+            }
+        }
+    }
+#pragma unroll
+    for(int h=0;h<HEADS;++h)shared[h*COMBINE+warp*ROWS+lane]=acc[h];
+    __syncthreads();
+    if(warp==0){
+        if(row>full)return;
+        float h[HEADS];
+#pragma unroll
+        for(int j=0;j<HEADS;++j){
+            float v=__fadd_rn(0.0f,shared[j*COMBINE+lane]);
+            v=__fadd_rn(v,shared[j*COMBINE+ROWS+lane]);
+            h[j]=fmaxf(v,0.0f);
+        }
+        float sum=__fadd_rn(__fadd_rn(__fadd_rn(h[0],h[1]),h[2]),h[3]);
+        if(bias)sum=__fadd_rn(sum,bias[row]);
+        sum=__fadd_rn(sum,row==full&&n%R?1e9f:0.0f);
+        sum=__fadd_rn(sum,0.0f);
+        for(int i=row*R;i<n&&i<(row+1)*R;++i)cells[i]=sum;
+    }
+}
+#endif  // STRATA_HIP
 struct Span{const void* p;size_t n;};
 void validate(Span s){
     const auto p=reinterpret_cast<uintptr_t>(s.p);

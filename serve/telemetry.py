@@ -103,6 +103,67 @@ class _Nvml:
         return out
 
 
+# ------------------------------------------------------------------------------------------------ AMD (sysfs)
+class _AmdSysfs:
+    """AMD port (Linux): the same readings from the amdgpu kernel driver's files under /sys, so no ROCm library is
+    needed.  Picks the AMD card with the most VRAM.  Same interface as _Nvml: ok(), name(), read()."""
+
+    def __init__(self):
+        self.dev = None
+        self.hwmon = None
+        best = -1
+        try:
+            import glob
+            for d in sorted(glob.glob("/sys/class/drm/card[0-9]*/device")):
+                try:
+                    if open(d + "/vendor").read().strip() != "0x1002":
+                        continue
+                    vram = int(open(d + "/mem_info_vram_total").read())
+                except (OSError, ValueError):
+                    continue
+                if vram > best:
+                    best, self.dev = vram, d
+            if self.dev:
+                hw = sorted(glob.glob(self.dev + "/hwmon/hwmon*"))
+                self.hwmon = hw[0] if hw else None
+        except Exception:
+            self.dev = None
+
+    def ok(self):
+        return self.dev is not None
+
+    def _int(self, path):
+        try:
+            return int(open(path).read().strip())
+        except (OSError, ValueError, TypeError):
+            return None
+
+    def name(self):
+        try:
+            import subprocess
+            r = subprocess.run(["rocminfo"], capture_output=True, text=True, timeout=10).stdout
+            for line in r.splitlines():
+                if "Marketing Name:" in line and "Radeon" in line:
+                    return line.split(":", 1)[1].strip()
+        except Exception:
+            pass
+        return "AMD Radeon GPU"
+
+    def read(self):
+        d, h = self.dev, self.hwmon
+        out = {"util": self._int(d + "/gpu_busy_percent"),
+               "mem_used": self._int(d + "/mem_info_vram_used"), "mem_total": self._int(d + "/mem_info_vram_total")}
+        if h:
+            t = self._int(h + "/temp2_input") or self._int(h + "/temp1_input")        # junction, else edge
+            out["temp"] = t / 1000.0 if t is not None else None
+            p = self._int(h + "/power1_average") or self._int(h + "/power1_input")     # microwatts
+            out["power"] = p / 1e6 if p is not None else None
+            c = self._int(h + "/power1_cap")
+            out["power_limit"] = c / 1e6 if c is not None else None
+        out["pcie_width"] = self._int(d + "/current_link_width")
+        return out
+
+
 # ------------------------------------------------------------------------------------------------ CPU / RAM
 def _cpu_name():
     if os.name == "nt":
@@ -176,6 +237,10 @@ class Telemetry:
         self.now: dict = {}
         self.hist = collections.defaultdict(lambda: collections.deque(maxlen=HISTORY))
         self.gpu = _Nvml()
+        if not self.gpu.ok():
+            amd = _AmdSysfs()                          # AMD port: no NVML on this PC, try an AMD card
+            if amd.ok():
+                self.gpu = amd
         try:
             import psutil  # noqa: F401
             self.ps = sys.modules["psutil"]

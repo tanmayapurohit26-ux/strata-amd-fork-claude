@@ -4,6 +4,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <vector>
 
@@ -30,10 +31,35 @@ const ggml_cuda_device_info & ggml_cuda_info() {
             cudaDeviceProp prop;
             CUDA_CHECK(cudaGetDeviceProperties(&prop, id));
             auto & d = in.devices[id];
+#if defined(GGML_USE_HIP)
+            // AMD: llama.cpp encodes the gfx id ("gfx1100" -> 0x1100) above GGML_CUDA_CC_OFFSET_AMD; MMQ picks its
+            // RDNA3 code path from this number (ggml-cuda.cu, ggml_cuda_parse_id).
+            {
+                const char * arch = prop.gcnArchName;
+                if (std::strncmp(arch, "gfx", 3) == 0) arch += 3;
+                char digits[16] = {0};
+                size_t len = std::strcspn(arch, ":-");
+                if (len >= sizeof(digits)) len = sizeof(digits) - 1;
+                std::memcpy(digits, arch, len);
+                int major = 0, minor = 0;
+                if (len >= 3) {
+                    minor = (int) std::strtoul(digits + len - 2, nullptr, 16);
+                    digits[len - 2] = '\0';
+                    major = (int) std::strtoul(digits, nullptr, 16);
+                }
+                d.cc = GGML_CUDA_CC_OFFSET_AMD + major * 0x100 + minor;
+                if ((d.cc & 0xff00) == 0 && prop.major > 0)
+                    d.cc = GGML_CUDA_CC_OFFSET_AMD + prop.major * 0x100 + prop.minor * 0x10;
+            }
+            d.nsm = prop.multiProcessorCount;
+            d.smpb = prop.sharedMemPerBlock;
+            d.smpbo = prop.sharedMemPerBlock;   // AMD has no opt-in shared-memory tier
+#else
             d.cc = 100 * prop.major + 10 * prop.minor;
             d.nsm = prop.multiProcessorCount;
             d.smpb = prop.sharedMemPerBlock;
             d.smpbo = prop.sharedMemPerBlockOptin;
+#endif
             d.integrated = prop.integrated != 0;
             d.vmm = false;
             d.total_vram = prop.totalGlobalMem;

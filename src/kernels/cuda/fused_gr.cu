@@ -300,6 +300,19 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
         std::fprintf(stderr, "fused_gr_read_multi: invalid arguments\n");
         std::exit(1);
     }
+#if defined(STRATA_HIP)
+    // AMD port: gr_down_multi_kernel stages TILE floats (10 KB) of shared memory per token, and RDNA3 allows
+    // 64 KB per block, so at most 6 tokens fit (NVIDIA's opt-in goes to 99 KB, enough for all 8).  The tokens are
+    // independent - one launch already runs them all in parallel - so more than 6 are done as two launches on
+    // the same stream, which runs them one after the other and lets them share the scratch buffer.
+    constexpr int kHipMaxT = (64 * 1024) / (TILE * (int) sizeof(float));
+    if (n_tok > kHipMaxT) {
+        const int first = n_tok / 2;
+        fused_gr_read_multi(a, first, xn_scratch, stream);
+        fused_gr_read_multi(a + first, n_tok - first, xn_scratch, stream);
+        return;
+    }
+#endif
     GrMulti m;
     for (int t = 0; t < n_tok; ++t) {
         m.a[t] = a[t];
@@ -317,8 +330,12 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     gr_norm_multi_kernel<<<n_tok, THREADS, 0, st>>>(m);
     static bool attr = false;
     if (!attr) {
+#if defined(STRATA_HIP)
+        cudaFuncSetAttribute(gr_down_multi_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024);
+#else
         cudaFuncSetAttribute(gr_down_multi_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              (int) (kFusedGrMaxT * TILE * sizeof(float)));
+#endif
         attr = true;
     }
     gr_down_multi_kernel<<<DOWN_BLOCKS + 1, THREADS, (size_t) n_tok * TILE * sizeof(float), st>>>(m);

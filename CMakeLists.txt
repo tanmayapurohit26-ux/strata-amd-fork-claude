@@ -33,6 +33,12 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 option(STRATA_ENABLE_CUDA "Build the CUDA targets (Phase 2+)" OFF)
+# AMD port: the same GPU targets, compiled with ROCm's HIP instead of CUDA.  The sources stay CUDA; hip_shim/
+# stands in for NVIDIA's headers and include/strata/gpu/hip_compat.hpp maps the names onto HIP.
+option(STRATA_ENABLE_HIP "Build the GPU targets for an AMD GPU with ROCm/HIP instead of CUDA" OFF)
+if(STRATA_ENABLE_HIP)
+  set(STRATA_ENABLE_CUDA ON CACHE BOOL "" FORCE)
+endif()
 # The test suite and the micro benchmarks live in tests/ and bench/micro/, which the published source leaves out.
 set(_strata_tests_default OFF)
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/bench/micro)
@@ -41,7 +47,33 @@ endif()
 option(STRATA_BUILD_TESTS "Build the test suite" ${_strata_tests_default})
 option(STRATA_WERROR "Treat compiler warnings as errors" OFF)
 
-if(STRATA_ENABLE_CUDA)
+if(STRATA_ENABLE_HIP)
+  if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
+    set(CMAKE_HIP_ARCHITECTURES gfx1100 CACHE STRING "AMD GPU architectures (gfx1100 = RX 7900 XT/XTX)" FORCE)
+  endif()
+  enable_language(HIP)
+  find_package(hip REQUIRED)
+  find_package(hipblas REQUIRED)
+  # Stand-ins for the CUDA toolkit's imported targets, so every existing `CUDA::cudart` / `CUDA::cublas` link
+  # line below works unchanged: they bring in the HIP runtime, the shim headers and hipBLAS.
+  add_library(CUDA::cudart INTERFACE IMPORTED)
+  target_link_libraries(CUDA::cudart INTERFACE hip::host)
+  target_include_directories(CUDA::cudart INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/hip_shim ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_definitions(CUDA::cudart INTERFACE STRATA_HIP=1 HIP_DISABLE_WARP_SYNC_BUILTINS=1)
+  # every HIP file sees the compat layer first, even the ones that include a Strata header before <cuda_runtime.h>
+  target_compile_options(CUDA::cudart INTERFACE "$<$<COMPILE_LANGUAGE:HIP>:SHELL:-include strata/gpu/hip_compat.hpp>")
+  target_compile_options(CUDA::cudart INTERFACE $<$<COMPILE_LANGUAGE:HIP>:-Wno-unused-result>
+                                                $<$<COMPILE_LANGUAGE:HIP>:-Wno-deprecated-declarations>
+                                                $<$<COMPILE_LANGUAGE:CXX>:-Wno-deprecated-declarations>)
+  add_library(CUDA::cublas INTERFACE IMPORTED)
+  target_link_libraries(CUDA::cublas INTERFACE roc::hipblas)
+  # the host test programs add this variable to their include path for the CUDA headers
+  set(CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/hip_shim)
+  # every .cu in this tree is compiled as HIP
+  file(GLOB_RECURSE _strata_cu CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cu ${CMAKE_CURRENT_SOURCE_DIR}/bench/*.cu)
+  set_source_files_properties(${_strata_cu} PROPERTIES LANGUAGE HIP)
+  message(STATUS "Strata: HIP (AMD ROCm) enabled, arch ${CMAKE_HIP_ARCHITECTURES}")
+elseif(STRATA_ENABLE_CUDA)
   enable_language(CUDA)
   # `enable_language(CUDA)` gives the .cu compile rules but NOT the imported targets, so `CUDA::cudart` has to
   # be brought in explicitly for the host-side tests that call cudaMalloc themselves.
@@ -214,7 +246,7 @@ if(STRATA_ENABLE_CUDA)
     src/kernels/cuda/native_flash_attn.cu
     src/kernels/cuda/native_qsa_indexer.cu
     src/kernels/cuda/native_qsa_score.cu
-    PROPERTIES COMPILE_OPTIONS "--use_fast_math")
+    PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>")
 
   set(STRATA_ORACLE_SOURCE_DIR "" CACHE PATH "Pinned llama.cpp source for independent CUDA parity tests")
   set(STRATA_ORACLE_BUILD_DIR "" CACHE PATH "Matching existing shared llama.cpp build")
@@ -337,6 +369,11 @@ if(STRATA_ENABLE_CUDA)
   target_include_directories(s_gemv_q8k_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(s_gemv_q8k_parity PRIVATE strata_kernels CUDA::cudart)
   add_test(NAME s_gemv_q8k_parity COMMAND s_gemv_q8k_parity --selftest)
+
+  # AMD port: the QSA block scorer (TF32 tensor cores on NVIDIA, plain F32 on AMD) vs a double-precision reference.
+  add_executable(native_qsa_score_test src/kernels/native_qsa_score_test.cpp)
+  target_include_directories(native_qsa_score_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(native_qsa_score_test PRIVATE strata_kernels CUDA::cudart)
 
   add_executable(qsa_parity src/kernels/qsa_parity.cpp)
   target_include_directories(qsa_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
@@ -541,10 +578,23 @@ if(STRATA_NATIVE_EXPERTS)
     target_include_directories(strata_mmq PRIVATE ${_strata_gg}/include ${_strata_gg}/src ${_strata_mmq}
                                PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_compile_options(strata_mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda -use_fast_math>)
+    if(STRATA_ENABLE_HIP)
+      # llama.cpp's MMQ has its own AMD path (vendors/hip.h), selected by GGML_USE_HIP - the same way llama.cpp's
+      # ROCm build compiles these files.
+      get_target_property(_strata_mmq_srcs strata_mmq SOURCES)
+      set_source_files_properties(${_strata_mmq_srcs} PROPERTIES LANGUAGE HIP)
+      target_compile_definitions(strata_mmq PRIVATE GGML_USE_HIP GGML_HIP_NO_VMM)
+      target_compile_options(strata_mmq PRIVATE -Wno-unused-result)
+    endif()
     if(MSVC)
       target_compile_options(strata_mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>)
     endif()
-    target_link_libraries(strata_mmq PUBLIC ggml-base CUDA::cudart)
+    if(STRATA_ENABLE_HIP)
+      # not CUDA::cudart: that brings Strata's shim, and these files use llama.cpp's own vendors/hip.h instead
+      target_link_libraries(strata_mmq PUBLIC ggml-base hip::host)
+    else()
+      target_link_libraries(strata_mmq PUBLIC ggml-base CUDA::cudart)
+    endif()
     target_link_libraries(strata_prefill PUBLIC strata_mmq)
     target_compile_definitions(strata_prefill PUBLIC STRATA_PREFILL_MMQ=1)
   endif()

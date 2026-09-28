@@ -25,10 +25,17 @@
 #include <cstdint>
 #include <cstring>
 
-#if defined(__CUDACC__)
+#if defined(__CUDACC__) || defined(__HIPCC__)
 #define STRATA_HD __host__ __device__
 #else
 #define STRATA_HD
+#endif
+
+// memcpy is a host function to the HIP compiler; the builtin works in both host and device code.
+#if defined(__HIPCC__)
+#define STRATA_BITCOPY __builtin_memcpy
+#else
+#define STRATA_BITCOPY std::memcpy
 #endif
 
 namespace strata::kernels {
@@ -36,7 +43,7 @@ namespace strata::kernels {
 /// Round-to-nearest-even f32 -> fp16, returned as raw bits.
 STRATA_HD inline uint16_t f16_from_f32(float f) {
     uint32_t x;
-    std::memcpy(&x, &f, 4);
+    STRATA_BITCOPY(&x, &f, 4);
     const uint32_t sign = (x >> 16) & 0x8000u;
     const uint32_t rawexp = (x >> 23) & 0xFFu;
     int exp = (int) rawexp - 127 + 15;
@@ -89,7 +96,7 @@ STRATA_HD inline float f32_from_f16(uint16_t h) {
         out = sign | ((ex - 15 + 127) << 23) | (man << 13);
     }
     float f;
-    std::memcpy(&f, &out, 4);
+    STRATA_BITCOPY(&f, &out, 4);
     return f;
 }
 

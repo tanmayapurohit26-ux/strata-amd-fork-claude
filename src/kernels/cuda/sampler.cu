@@ -206,9 +206,11 @@ __global__ void sampler_kernel(const float* __restrict__ logits, int n_vocab, in
     const int KMAX = 64;
     int k = p.top_k > 0 ? (p.top_k < KMAX ? p.top_k : KMAX) : 0;
     if (k <= 0) {
+#if !defined(STRATA_HIP)   // device printf is not reliable on every ROCm version; the host side validates too
         if (threadIdx.x == 0)
             std::printf("sampler: the sampled path needs top_k in 1..%d (got %d); greedy needs no filters\n",
                         KMAX, p.top_k);
+#endif
         return;   // leave out[t] unwritten rather than returning an uninitialised token
     }
 
