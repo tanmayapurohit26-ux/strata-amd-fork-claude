@@ -677,6 +677,9 @@ class Service:
                         "time": started, "duration_s": round(time.time() - started, 1), "finish": finish,
                         "prompt_tokens": len(ids), "reused": last.get("reused"), "output_tokens": n,
                         "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
+                        "drafts_accepted": last.get("drafts_accepted"),    # AMD port: for Rig Control's
+                        "drafts_offered": last.get("drafts_offered"),      # speed panel
+                        "max_tokens": max_new,
                         "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
                         if n and last.get("generated") and last.get("decode_ms") else None})
                     now = time.time()
