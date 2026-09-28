@@ -15,6 +15,8 @@ and the formats change often; the engine boundary is token ids in, text deltas o
 """
 from __future__ import annotations
 
+import os
+
 import json
 import uuid
 from dataclasses import dataclass, field
@@ -62,6 +64,15 @@ IMAGE_PARTS = ("image_url", "input_image", "image")
 # enable_thinking=false for none.  Clients spell these many ways; everything maps onto those four.
 EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false": None,
           "low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh", "max": "xhigh", "maximum": "xhigh"}
+
+# Optional remapping, for clients that cannot be configured (e.g. one that always sends "minimal", which would
+# switch thinking off): STRATA_EFFORT_ALIASES="minimal=high" makes "minimal" mean "high".  Comma-separated pairs;
+# the right-hand side must be one of the levels above.  Unset: no change.
+for _pair in os.environ.get("STRATA_EFFORT_ALIASES", "").split(","):
+    if "=" in _pair:
+        _k, _v = (x.strip().lower() for x in _pair.split("=", 1))
+        if _v in EFFORT:
+            EFFORT[_k] = EFFORT[_v]
 
 
 def effort_kwargs(value) -> dict:
