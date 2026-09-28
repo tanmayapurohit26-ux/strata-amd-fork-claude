@@ -815,7 +815,7 @@ def main() -> int:
     ap.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
 
-    say("Strata - Qwen3.8-Flash-Next on a normal PC (NVIDIA GPU + system RAM + CPU)")
+    say("Strata - Qwen3.8-Flash-Next on a normal PC (NVIDIA or AMD GPU + system RAM + CPU)")
 
     # ---- 0. already installed: just start it
     have = installed_configs()
