@@ -9,6 +9,7 @@
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/iq_avx512.hpp"
+#include "strata/kernels/cpu/expert_layout.hpp"
 #include "ggml-cpu.h"
 #include "strata/kernels/iq_kernels.hpp"
 
@@ -102,7 +103,8 @@ int main(int argc, char** argv) {
                 ffp[k] = ff[k].data();
             }
             cpu::native_gu_rows(f, blob.data(), a, NT, ffp, 0, (int) FF);
-            if (cpu::iq512_supported(f.gu_type)) {
+            // AMD port: only on a CPU that has AVX-512 (a Ryzen 5000 has AVX2 only: the engine already checks this)
+            if (cpu::cpu_avx512_ok() && cpu::iq512_supported(f.gu_type)) {
                 // the AVX-512 rows against ggml's own vec_dot, same Q8_K activations: float-order differences only
                 std::vector<float> g512((size_t) NT * FF), gref((size_t) NT * FF);
                 float* gp[NT];
@@ -145,18 +147,21 @@ int main(int argc, char** argv) {
             }
             cpu::native_down_rows(f, blob.data(), hp, NT, op, 0, (int) H);
             if (f.d_type == 42) {
-                // (b2) the AVX-512 GGUF-layout Q2_0 kernel the pool uses for Q2_0 down projections
+                // (b2) the GGUF-layout Q2_0 kernel the pool uses for Q2_0 down projections.  AMD port: through the
+                // same dispatchers the engine calls (q2_rows_any / act_quant_any), so an AVX2-only CPU runs - and
+                // tests - the AVX2 kernel instead of crashing on the AVX-512 one.
                 std::vector<cpu::ActQ> a2(NT);
                 const cpu::ActQ* ap[NT];
                 std::vector<float> alt((size_t) NT * H);
                 float* altp[NT];
                 for (int k = 0; k < NT; ++k) {
-                    cpu::act_quant_q8_1(ff[k].data(), (int) FF, a2[k]);
+                    cpu::act_quant_any(ff[k].data(), (int) FF, a2[k]);
                     ap[k] = &a2[k];
                     altp[k] = alt.data() + k * H;
                 }
-                cpu::q2_0_gguf_rows_multi(blob.data() + f.down_off, f.d_row, (int) (FF / 64), ap, NT, altp, 0, (int) H);
-                std::printf("          q2_0 AVX-512 down vs ggml down: rel %.2e\n", rel(alt, got_c));
+                cpu::q2_rows_any(blob.data() + f.down_off, f.d_row, (int) (FF / 64), ap, NT, altp, 0, (int) H);
+                std::printf("          q2_0 %s down vs ggml down: rel %.2e\n", cpu::cpu_avx512_ok() ? "AVX-512" : "AVX2",
+                            rel(alt, got_c));
             }
         }
         // (c) the GPU: one group holding the NT entries
